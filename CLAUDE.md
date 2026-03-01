@@ -15,7 +15,10 @@ github-actions/
 ├── generate-release/    # Generate changelog and create GitHub Release
 ├── rclone-upload/       # Upload files to S3-compatible storage via rclone
 ├── promote-rc/          # Promote RC tag to final release
-└── .github/workflows/   # CI (lint) + Release (floating tags)
+├── docs/                # MkDocs source (symlinks to action READMEs)
+├── mkdocs.yml           # MkDocs Material configuration
+├── requirements-docs.txt # Docs Python dependencies
+└── .github/workflows/   # CI (lint) + Release (floating tags) + Docs (gh-pages)
 ```
 
 ## Conventions
@@ -26,6 +29,13 @@ github-actions/
 - Shell scripts use `set -euo pipefail`, pass ShellCheck
 - All `action.yml` files must be valid YAML
 - Versioning: semantic tags (`v1.0.0`), floating major tags (`v1`)
+
+## Documentation Site
+
+- Built with MkDocs Material, deployed to GitHub Pages at `https://moreirodamian.github.io/github-actions/`
+- Action docs are **symlinks** from `docs/actions/*.md` → `<action>/README.md` — no content duplication
+- `docs/index.md` and `docs/getting-started.md` are standalone pages
+- Deployment: automatic on push to `main` via `.github/workflows/docs.yml`
 
 ## Commands
 
@@ -38,4 +48,8 @@ shellcheck generate-release/generate-changelog.sh
 
 # Check for client-specific strings (should return nothing)
 grep -ri "kodear\|4piot\|treasuregame\|linear.app\|atlassian.net" --include="*.yml" --include="*.sh" --include="*.md" .
+
+# Preview docs locally
+pip install -r requirements-docs.txt
+mkdocs serve
 ```

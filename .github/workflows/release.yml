@@ -25,11 +25,45 @@ jobs:
             exit 1
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          # Extract major and minor for floating tags
           MAJOR="${TAG%%.*}"
           MINOR="${TAG%.*}"
           echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
           echo "minor=$MINOR" >> "$GITHUB_OUTPUT"
+
+      - name: Find previous tag
+        id: prev
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          PREV="$(git tag -l 'v*.*.*' --sort=-version:refname | grep -v "${GITHUB_REF_NAME}" | head -1 || true)"
+          echo "tag=${PREV}" >> "$GITHUB_OUTPUT"
+          COMMITS="$(git rev-list "${PREV}..${GITHUB_REF_NAME}" --count 2>/dev/null || echo '?')"
+          echo "commits=${COMMITS}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release header
+        id: header
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          PREV: ${{ steps.prev.outputs.tag }}
+          COMMITS: ${{ steps.prev.outputs.commits }}
+        run: |
+          set -euo pipefail
+          DATE="$(date '+%B %d, %Y')"
+          REPO="${GITHUB_REPOSITORY}"
+          {
+            echo "body<<BODY_EOF"
+            echo "# ${TAG}"
+            echo ""
+            echo "> **Released:** ${DATE} | **Commits:** ${COMMITS} | **Pin:** \`uses: ${REPO}/<action>@${TAG%%.*}\`"
+            echo ""
+            if [[ -n "${PREV}" ]]; then
+              echo "**Full diff:** [\`${PREV}...${TAG}\`](https://github.com/${REPO}/compare/${PREV}...${TAG})"
+              echo ""
+            fi
+            echo "---"
+            echo ""
+            echo "BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: ncipollo/release-action@v1
@@ -38,6 +72,7 @@ jobs:
           makeLatest: true
           name: ${{ steps.tag.outputs.tag }}
           tag: ${{ steps.tag.outputs.tag }}
+          body: ${{ steps.header.outputs.body }}
 
       - name: Update floating tags
         run: |

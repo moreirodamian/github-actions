@@ -1,0 +1,61 @@
+site_name: Reusable GitHub Actions
+site_url: https://moreirodamian.github.io/github-actions/
+site_description: Production-ready, reusable GitHub Actions for CI/CD pipelines
+site_author: Damian Moreiro
+
+repo_name: moreirodamian/github-actions
+repo_url: https://github.com/moreirodamian/github-actions
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: deep purple
+      accent: purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - content.code.copy
+    - navigation.instant
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - search.suggest
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - tables
+
+extra_css:
+  - stylesheets/extra.css
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Actions:
+      - ArgoCD Deploy: actions/argocd-deploy.md
+      - Docker Build & Push: actions/docker-build.md
+      - Version Bump: actions/version-bump.md
+      - Generate Release: actions/generate-release.md
+      - Rclone Upload: actions/rclone-upload.md
+      - Promote RC: actions/promote-rc.md

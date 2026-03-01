@@ -1,0 +1,28 @@
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+    authors:
+      - dependabot
+      - github-actions
+  categories:
+    - title: "New Features"
+      labels:
+        - enhancement
+        - feature
+    - title: "Bug Fixes"
+      labels:
+        - bug
+        - bugfix
+    - title: "Infrastructure & CI/CD"
+      labels:
+        - ci
+        - infrastructure
+        - devops
+    - title: "Documentation"
+      labels:
+        - documentation
+        - docs
+    - title: "Other Changes"
+      labels:
+        - "*"
