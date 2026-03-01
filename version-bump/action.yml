@@ -1,0 +1,329 @@
+name: "Bump Version"
+description: "Bumps semantic version in JSON, YAML, or TOML files. Supports RC tags, platform annotations, and configurable version keys."
+
+inputs:
+  version_file:
+    description: "Path to the version file (JSON, YAML, or TOML)."
+    required: true
+    default: "config.json"
+  version_key:
+    description: "Key path to the version field (yq/jq syntax). Example: '.version', '.tool.poetry.version'"
+    required: false
+    default: ".version"
+  version_type:
+    description: "Which part to bump: major, minor, or patch."
+    required: true
+    default: "patch"
+  platforms:
+    description: "Platform marker for the git tag annotation (mobile|web|all)."
+    required: false
+    default: "all"
+  is_final_release:
+    description: "If false, creates an RC tag (vX.Y.Z-rc.N) instead of a final tag."
+    required: false
+    default: "true"
+  bot_pat:
+    description: "Optional PAT for pushing. If set, re-checkouts with this token."
+    required: false
+    default: ""
+  public_changelog:
+    description: "Optional public changelog text to save as public_changelog/vX.Y.Z.txt."
+    required: false
+    default: ""
+  git_user_name:
+    description: "Git user name for commits and tags."
+    required: false
+    default: "github-actions"
+  git_user_email:
+    description: "Git user email for commits and tags."
+    required: false
+    default: "github-actions@github.com"
+  dry_run:
+    description: "If true, calculates the new version without committing or tagging."
+    required: false
+    default: "false"
+
+outputs:
+  new_version:
+    description: "The new version string (e.g. 1.2.3)"
+    value: ${{ steps.bump.outputs.new_version }}
+  previous_version:
+    description: "The version before bumping"
+    value: ${{ steps.bump.outputs.previous_version }}
+  tag_name:
+    description: "The git tag created (e.g. v1.2.3 or v1.2.3-rc.1)"
+    value: ${{ steps.tag.outputs.tag_name }}
+  is_rc:
+    description: "Whether an RC tag was created (true/false)"
+    value: ${{ steps.tag.outputs.is_rc }}
+  bump_performed:
+    description: "Whether a version bump was performed (true/false)"
+    value: ${{ steps.bump.outputs.bump_performed }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout with PAT
+      if: ${{ inputs.bot_pat != '' && inputs.dry_run != 'true' }}
+      uses: actions/checkout@v4
+      with:
+        token: ${{ inputs.bot_pat }}
+        fetch-depth: 0
+        persist-credentials: true
+
+    - name: Checkout with default GITHUB_TOKEN
+      if: ${{ inputs.bot_pat == '' || inputs.dry_run == 'true' }}
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        persist-credentials: true
+
+    - name: Ensure tools are installed
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v yq &>/dev/null; then
+          echo "Installing yq..."
+          curl -sL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64" -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+        fi
+        if ! command -v jq &>/dev/null; then
+          echo "Installing jq..."
+          sudo apt-get update -y && sudo apt-get install -y jq
+        fi
+
+    - name: Normalize git safe directory
+      shell: bash
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+    - name: Configure git identity
+      shell: bash
+      env:
+        GIT_USER_NAME: ${{ inputs.git_user_name }}
+        GIT_USER_EMAIL: ${{ inputs.git_user_email }}
+      run: |
+        git config user.name "${GIT_USER_NAME}"
+        git config user.email "${GIT_USER_EMAIL}"
+
+    - name: Bump version
+      id: bump
+      shell: bash
+      env:
+        VERSION_FILE: ${{ inputs.version_file }}
+        VERSION_TYPE: ${{ inputs.version_type }}
+        VERSION_KEY: ${{ inputs.version_key }}
+        IS_FINAL_RAW: ${{ inputs.is_final_release }}
+      run: |
+        set -euo pipefail
+
+        EXT="${VERSION_FILE##*.}"
+
+        # Read current version based on file type
+        case "${EXT}" in
+          json)
+            CURRENT_VERSION="$(jq -r "${VERSION_KEY}" "${VERSION_FILE}")"
+            ;;
+          yaml|yml)
+            CURRENT_VERSION="$(yq "${VERSION_KEY}" "${VERSION_FILE}")"
+            ;;
+          toml)
+            CURRENT_VERSION="$(yq -p toml "${VERSION_KEY}" "${VERSION_FILE}")"
+            ;;
+          *)
+            echo "::error::Unsupported file type: ${EXT}. Supported: json, yaml, yml, toml"
+            exit 1
+            ;;
+        esac
+
+        echo "Current version: ${CURRENT_VERSION}"
+        echo "previous_version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+
+        # Strip pre-release and build metadata
+        CORE="${CURRENT_VERSION%%+*}"
+        CORE="${CORE%%-*}"
+
+        IFS='.' read -r MAJOR MINOR PATCH <<< "${CORE}"
+
+        # Parse is_final_release
+        IS_FINAL_LOWER="$(echo "${IS_FINAL_RAW:-true}" | tr '[:upper:]' '[:lower:]')"
+        case "${IS_FINAL_LOWER}" in
+          true|1|yes|on) IS_FINAL=true ;;
+          *) IS_FINAL=false ;;
+        esac
+
+        git fetch --tags --force >/dev/null 2>&1 || true
+        HAS_RC_FOR_CORE="$(git tag -l "v${CORE}-rc.*" | wc -l | tr -d '[:space:]')"
+
+        DO_BUMP=false
+        if ${IS_FINAL}; then
+          DO_BUMP=true
+        elif [[ "${HAS_RC_FOR_CORE}" == "0" ]]; then
+          DO_BUMP=true
+          echo "No existing RCs for ${CORE}: initial RC, will bump."
+        else
+          echo "Existing RCs found for ${CORE}: continuing RC cycle without bump."
+        fi
+
+        if ${DO_BUMP}; then
+          case "${VERSION_TYPE}" in
+            patch) PATCH=$((PATCH + 1)) ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            *) echo "::error::Unsupported version type: ${VERSION_TYPE}"; exit 1 ;;
+          esac
+
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "New version (bumped): ${NEW_VERSION}"
+          echo "bump_performed=true" >> "$GITHUB_OUTPUT"
+        else
+          NEW_VERSION="${CORE}"
+          echo "Keeping version (no bump): ${NEW_VERSION}"
+          echo "bump_performed=false" >> "$GITHUB_OUTPUT"
+        fi
+
+        echo "new_version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+
+    - name: Write version to file
+      if: ${{ inputs.dry_run != 'true' && steps.bump.outputs.bump_performed == 'true' }}
+      shell: bash
+      env:
+        VERSION_FILE: ${{ inputs.version_file }}
+        VERSION_KEY: ${{ inputs.version_key }}
+        NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+      run: |
+        set -euo pipefail
+        EXT="${VERSION_FILE##*.}"
+
+        case "${EXT}" in
+          json)
+            jq --arg v "${NEW_VERSION}" "${VERSION_KEY} = \$v" "${VERSION_FILE}" > tmp && mv tmp "${VERSION_FILE}"
+            ;;
+          yaml|yml)
+            yq -i "${VERSION_KEY} = \"${NEW_VERSION}\"" "${VERSION_FILE}"
+            ;;
+          toml)
+            yq -i -p toml -o toml "${VERSION_KEY} = \"${NEW_VERSION}\"" "${VERSION_FILE}"
+            ;;
+        esac
+
+    - name: Write public changelog
+      if: ${{ inputs.dry_run != 'true' && inputs.public_changelog != '' }}
+      shell: bash
+      env:
+        CONTENT: ${{ inputs.public_changelog }}
+        NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+      run: |
+        set -euo pipefail
+        if [[ -n "${CONTENT//[[:space:]]/}" ]]; then
+          mkdir -p public_changelog
+          FILE_PATH="public_changelog/v${NEW_VERSION}.txt"
+          printf "%s\n" "${CONTENT}" > "${FILE_PATH}"
+          echo "Wrote ${FILE_PATH}"
+        fi
+
+    - name: Commit and push changes
+      if: ${{ inputs.dry_run != 'true' }}
+      shell: bash
+      env:
+        NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+      run: |
+        set -euo pipefail
+        git add -A
+        if git diff --cached --quiet; then
+          echo "No changes to commit."
+        else
+          git commit -m "[Release Process] [skip ci] Prepare release ${NEW_VERSION}"
+          BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+          echo "Pushing branch: ${BRANCH}"
+          git push origin "${BRANCH}"
+        fi
+
+    - name: Create and push tag
+      id: tag
+      if: ${{ inputs.dry_run != 'true' }}
+      shell: bash
+      env:
+        NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+        IS_FINAL_RAW: ${{ inputs.is_final_release }}
+        PLATFORM: ${{ inputs.platforms }}
+      run: |
+        set -euo pipefail
+
+        IS_FINAL_LOWER="$(echo "${IS_FINAL_RAW:-true}" | tr '[:upper:]' '[:lower:]')"
+        case "${IS_FINAL_LOWER}" in
+          true|1|yes|on) IS_FINAL=true ;;
+          *) IS_FINAL=false ;;
+        esac
+
+        case "${PLATFORM,,}" in
+          mobile|web|all) ;;
+          *) PLATFORM="all" ;;
+        esac
+
+        if ${IS_FINAL}; then
+          TAG_NAME="v${NEW_VERSION}"
+          echo "is_rc=false" >> "$GITHUB_OUTPUT"
+        else
+          EXISTING="$(git tag -l "v${NEW_VERSION}-rc.*" | sed -E 's/.*-rc\.([0-9]+)$/\1/' | sort -n | tail -1 || true)"
+          RC_NUM=$(( ${EXISTING:-0} + 1 ))
+          TAG_NAME="v${NEW_VERSION}-rc.${RC_NUM}"
+          echo "is_rc=true" >> "$GITHUB_OUTPUT"
+        fi
+
+        echo "Tagging ${TAG_NAME} (annotated) with platforms: ${PLATFORM}"
+        git tag -a "${TAG_NAME}" -m "platforms: ${PLATFORM}"
+        git push origin "${TAG_NAME}"
+        echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+    - name: Dry-run tag calculation
+      id: dry_tag
+      if: ${{ inputs.dry_run == 'true' }}
+      shell: bash
+      env:
+        NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+        IS_FINAL_RAW: ${{ inputs.is_final_release }}
+      run: |
+        set -euo pipefail
+        IS_FINAL_LOWER="$(echo "${IS_FINAL_RAW:-true}" | tr '[:upper:]' '[:lower:]')"
+        case "${IS_FINAL_LOWER}" in
+          true|1|yes|on) IS_FINAL=true ;;
+          *) IS_FINAL=false ;;
+        esac
+
+        if ${IS_FINAL}; then
+          echo "tag_name=v${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_rc=false" >> "$GITHUB_OUTPUT"
+        else
+          EXISTING="$(git tag -l "v${NEW_VERSION}-rc.*" | sed -E 's/.*-rc\.([0-9]+)$/\1/' | sort -n | tail -1 || true)"
+          RC_NUM=$(( ${EXISTING:-0} + 1 ))
+          echo "tag_name=v${NEW_VERSION}-rc.${RC_NUM}" >> "$GITHUB_OUTPUT"
+          echo "is_rc=true" >> "$GITHUB_OUTPUT"
+        fi
+        echo "[DRY RUN] Would create tag: $(cat "$GITHUB_OUTPUT" | grep tag_name | cut -d= -f2)"
+
+    - name: Job Summary
+      if: always()
+      shell: bash
+      env:
+        PREV: ${{ steps.bump.outputs.previous_version }}
+        NEW: ${{ steps.bump.outputs.new_version }}
+        TAG: ${{ steps.tag.outputs.tag_name || steps.dry_tag.outputs.tag_name }}
+        BUMP_TYPE: ${{ inputs.version_type }}
+        BUMP_DONE: ${{ steps.bump.outputs.bump_performed }}
+        DRY_RUN: ${{ inputs.dry_run }}
+      run: |
+        {
+          echo "## Version Bump Summary"
+          echo ""
+          if [[ "${DRY_RUN}" == "true" ]]; then
+            echo "> **DRY RUN** — no changes were committed"
+            echo ""
+          fi
+          echo "| Field | Value |"
+          echo "|-------|-------|"
+          echo "| Previous Version | \`${PREV:-N/A}\` |"
+          echo "| New Version | \`${NEW:-N/A}\` |"
+          echo "| Bump Type | ${BUMP_TYPE:-N/A} |"
+          echo "| Bump Performed | ${BUMP_DONE:-N/A} |"
+          echo "| Tag | \`${TAG:-N/A}\` |"
+        } >> "$GITHUB_STEP_SUMMARY"

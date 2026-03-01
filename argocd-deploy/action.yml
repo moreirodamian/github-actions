@@ -1,0 +1,232 @@
+name: "ArgoCD Deploy"
+description: "Installs ArgoCD CLI (with cache and multi-arch support) and deploys one or more ArgoCD apps, setting Helm values, syncing and waiting until healthy."
+
+inputs:
+  argocd_url:
+    description: "ArgoCD server URL (host:port or FQDN)."
+    required: true
+  argocd_token:
+    description: "ArgoCD auth token."
+    required: true
+  argocd_apps:
+    description: "Comma-separated list of ArgoCD application names to deploy."
+    required: true
+  version:
+    description: "Image tag / version to set (e.g. 1.2.3-abc123)."
+    required: true
+  revision:
+    description: "Git revision for the ArgoCD app source. Defaults to current workflow SHA."
+    required: false
+    default: "${{ github.sha }}"
+  image_tag_key:
+    description: "Helm values key path for the image tag (used when helm_values is empty)."
+    required: false
+    default: "app.image.tag"
+  helm_values:
+    description: "Comma-separated Helm values to set (e.g. 'key1=value1,key2=value2'). Overrides image_tag_key."
+    required: false
+    default: ""
+  timeout_seconds:
+    description: "Timeout in seconds for sync/wait operations."
+    required: false
+    default: "1200"
+  grpc_web:
+    description: "Use --grpc-web flag (true/false)."
+    required: false
+    default: "true"
+  argocd_cli_version:
+    description: "ArgoCD CLI version tag (from GitHub releases)."
+    required: false
+    default: "v2.13.3"
+  retry_count:
+    description: "Number of retries for sync operation (0 = no retry). Uses exponential backoff."
+    required: false
+    default: "0"
+  debug:
+    description: "If true, prints base64-encoded commands for local debugging."
+    required: false
+    default: "false"
+
+outputs:
+  deployed_apps:
+    description: "Comma-separated list of successfully deployed app names"
+    value: ${{ steps.deploy.outputs.deployed_apps }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Detect platform
+      id: platform
+      shell: bash
+      run: |
+        set -euo pipefail
+        ARCH="${RUNNER_ARCH:-X64}"
+        case "${ARCH}" in
+          X64)   echo "arch=amd64" >> "$GITHUB_OUTPUT" ;;
+          ARM64) echo "arch=arm64" >> "$GITHUB_OUTPUT" ;;
+          *)     echo "arch=amd64" >> "$GITHUB_OUTPUT" ;;
+        esac
+        OS="${RUNNER_OS:-Linux}"
+        echo "os=$(echo "${OS}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+    - name: Cache ArgoCD CLI
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: /usr/local/bin/argocd
+        key: argocd-cli-${{ inputs.argocd_cli_version }}-${{ steps.platform.outputs.os }}-${{ steps.platform.outputs.arch }}
+
+    - name: Install ArgoCD CLI
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.argocd_cli_version }}
+        ARCH: ${{ steps.platform.outputs.arch }}
+        OS: ${{ steps.platform.outputs.os }}
+      run: |
+        set -euo pipefail
+        BIN_PATH="/usr/local/bin/argocd"
+        URL="https://github.com/argoproj/argo-cd/releases/download/${CLI_VERSION}/argocd-${OS}-${ARCH}"
+        echo "Installing ArgoCD CLI ${CLI_VERSION} (${OS}/${ARCH}) from ${URL}"
+        curl -sSL -o "${BIN_PATH}" "${URL}"
+        chmod 555 "${BIN_PATH}"
+        "${BIN_PATH}" version --client 2>/dev/null || echo "Installed"
+
+    - name: Verify CLI
+      shell: bash
+      run: /usr/local/bin/argocd version --client || true
+
+    - name: Deploy with ArgoCD
+      id: deploy
+      shell: bash
+      env:
+        ARGOCD_URL: ${{ inputs.argocd_url }}
+        ARGOCD_TOKEN: ${{ inputs.argocd_token }}
+        ARGOCD_APPS: ${{ inputs.argocd_apps }}
+        VERSION: ${{ inputs.version }}
+        REVISION: ${{ inputs.revision }}
+        IMAGE_TAG_KEY: ${{ inputs.image_tag_key }}
+        HELM_VALUES: ${{ inputs.helm_values }}
+        ARGOCD_TIMEOUT: ${{ inputs.timeout_seconds }}
+        GRPC_WEB: ${{ inputs.grpc_web }}
+        RETRY_COUNT: ${{ inputs.retry_count }}
+        DEBUG: ${{ inputs.debug }}
+      run: |
+        set -euo pipefail
+
+        ARGOCD_BIN="/usr/local/bin/argocd"
+        DEPLOY_START="$(date +%s)"
+
+        echo "Deploy started: $(date)"
+        echo "VERSION: ${VERSION}"
+        echo "REVISION: ${REVISION}"
+        echo "APPS: ${ARGOCD_APPS}"
+        echo "Timeout: ${ARGOCD_TIMEOUT}s"
+
+        # Build base flags as array (no eval)
+        BASE_FLAGS=()
+        if [[ "${GRPC_WEB}" == "true" || "${GRPC_WEB}" == "1" ]]; then
+          BASE_FLAGS+=(--grpc-web)
+        fi
+        BASE_FLAGS+=(--server "${ARGOCD_URL}" --auth-token "${ARGOCD_TOKEN}")
+
+        enc() { printf '%s' "$1" | base64 2>/dev/null || printf '%s' "$1" | base64; }
+
+        deployed_apps=()
+        summary_rows=""
+
+        while IFS=',' read -ra ADDR; do
+          for RAW_APP in "${ADDR[@]}"; do
+            ARGOCD_APP="$(echo "${RAW_APP}" | xargs)"
+            [[ -z "${ARGOCD_APP}" ]] && continue
+
+            APP_START="$(date +%s)"
+            echo "------------------------------------------------------------"
+            echo ">> Deploying: ${ARGOCD_APP}"
+
+            # Build helm-set arguments as array
+            HELM_SET_ARGS=()
+            HELM_VALUES_TRIM="$(echo "${HELM_VALUES:-}" | xargs || true)"
+            if [[ -n "${HELM_VALUES_TRIM}" ]]; then
+              IFS=',' read -r -a HELM_VALUES_ARRAY <<< "${HELM_VALUES_TRIM}"
+              for HELM_VAL in "${HELM_VALUES_ARRAY[@]}"; do
+                HELM_VAL_TRIM="$(echo "${HELM_VAL}" | xargs || true)"
+                [[ -z "${HELM_VAL_TRIM}" ]] && continue
+                HELM_SET_ARGS+=(--helm-set "${HELM_VAL_TRIM}")
+                echo ">> Helm: ${HELM_VAL_TRIM}"
+              done
+            else
+              HELM_SET_ARGS+=(--helm-set "${IMAGE_TAG_KEY}=${VERSION}")
+              echo ">> Helm: ${IMAGE_TAG_KEY}=${VERSION}"
+            fi
+
+            if [[ "${DEBUG}" == "true" || "${DEBUG}" == "1" ]]; then
+              echo ">> DEBUG(base64) set: $(enc "${ARGOCD_BIN} app set ${ARGOCD_APP} ${BASE_FLAGS[*]} --revision ${REVISION} ${HELM_SET_ARGS[*]}")"
+            fi
+
+            # app set
+            "${ARGOCD_BIN}" app set "${ARGOCD_APP}" "${BASE_FLAGS[@]}" \
+              --revision "${REVISION}" "${HELM_SET_ARGS[@]}"
+
+            # app sync with retry
+            MAX_RETRIES="${RETRY_COUNT:-0}"
+            ATTEMPT=0
+            SYNC_OK=false
+            while [[ ${ATTEMPT} -le ${MAX_RETRIES} ]]; do
+              if [[ ${ATTEMPT} -gt 0 ]]; then
+                BACKOFF=$(( 2 ** (ATTEMPT - 1) * 5 ))
+                echo ">> Retry ${ATTEMPT}/${MAX_RETRIES} in ${BACKOFF}s..."
+                sleep "${BACKOFF}"
+              fi
+              echo ">> Syncing: ${ARGOCD_APP} (attempt $((ATTEMPT + 1)))"
+              if "${ARGOCD_BIN}" app sync "${ARGOCD_APP}" "${BASE_FLAGS[@]}" \
+                --timeout "${ARGOCD_TIMEOUT}"; then
+                SYNC_OK=true
+                break
+              fi
+              ATTEMPT=$((ATTEMPT + 1))
+            done
+
+            if [[ "${SYNC_OK}" != "true" ]]; then
+              echo "::error::Sync failed for ${ARGOCD_APP} after $((MAX_RETRIES + 1)) attempt(s)"
+              APP_END="$(date +%s)"
+              APP_DURATION="$(( APP_END - APP_START ))s"
+              summary_rows+="| \`${ARGOCD_APP}\` | FAILED | ${APP_DURATION} |"$'\n'
+              continue
+            fi
+
+            # app wait
+            echo ">> Waiting for HEALTHY: ${ARGOCD_APP}"
+            "${ARGOCD_BIN}" app wait "${ARGOCD_APP}" "${BASE_FLAGS[@]}" \
+              --timeout "${ARGOCD_TIMEOUT}"
+
+            echo ">> ${ARGOCD_APP} is healthy."
+            deployed_apps+=("${ARGOCD_APP}")
+
+            APP_END="$(date +%s)"
+            APP_DURATION="$(( APP_END - APP_START ))s"
+            summary_rows+="| \`${ARGOCD_APP}\` | OK | ${APP_DURATION} |"$'\n'
+          done
+        done <<< "${ARGOCD_APPS}"
+
+        DEPLOY_END="$(date +%s)"
+        TOTAL_DURATION="$(( DEPLOY_END - DEPLOY_START ))s"
+
+        echo "Deploy completed: $(date) (total: ${TOTAL_DURATION})"
+
+        # Set output
+        DEPLOYED_CSV="$(IFS=','; echo "${deployed_apps[*]}")"
+        echo "deployed_apps=${DEPLOYED_CSV}" >> "$GITHUB_OUTPUT"
+
+        # Job Summary
+        {
+          echo "## ArgoCD Deploy Summary"
+          echo ""
+          echo "| App | Status | Duration |"
+          echo "|-----|--------|----------|"
+          echo -n "${summary_rows}"
+          echo ""
+          echo "**Total duration:** ${TOTAL_DURATION}"
+          echo ""
+          echo "**Version:** \`${VERSION}\` | **Revision:** \`${REVISION:0:12}\`"
+        } >> "$GITHUB_STEP_SUMMARY"

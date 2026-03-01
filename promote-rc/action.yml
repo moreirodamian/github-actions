@@ -1,0 +1,139 @@
+name: "Promote RC to Final Release"
+description: "Creates a final release tag (vX.Y.Z) from an RC tag (vX.Y.Z-rc.N), preserving platform annotation."
+
+inputs:
+  rc_tag:
+    description: "Specific RC tag to promote (e.g. v1.2.3-rc.2). If empty, uses the latest RC tag."
+    required: false
+    default: ""
+  git_user_name:
+    description: "Git user name for tagging."
+    required: false
+    default: "github-actions"
+  git_user_email:
+    description: "Git user email for tagging."
+    required: false
+    default: "github-actions@github.com"
+
+outputs:
+  final_version:
+    description: "The finalized version tag (e.g. v1.2.3)"
+    value: ${{ steps.finalize.outputs.final_version }}
+  rc_tag:
+    description: "The RC tag that was promoted"
+    value: ${{ steps.finalize.outputs.rc_tag }}
+  platforms:
+    description: "Platform annotation from the RC tag"
+    value: ${{ steps.finalize.outputs.platforms }}
+  already_exists:
+    description: "Whether the final tag already existed (true/false)"
+    value: ${{ steps.finalize.outputs.already_exists }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - id: finalize
+      name: Create final tag from RC
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RC_TAG_INPUT: ${{ inputs.rc_tag }}
+        GIT_USER_NAME: ${{ inputs.git_user_name }}
+        GIT_USER_EMAIL: ${{ inputs.git_user_email }}
+      run: |
+        set -euo pipefail
+
+        # Resolve RC tag
+        RC_TAG="${RC_TAG_INPUT:-}"
+        RC_TAG="$(echo "${RC_TAG}" | xargs || true)"
+
+        if [[ -z "${RC_TAG}" ]]; then
+          echo "Searching for latest release candidate tag..."
+          RC_TAG="$(git tag -l 'v*-rc.*' --sort=-creatordate | head -n 1 || true)"
+        fi
+
+        if [[ -z "${RC_TAG}" ]]; then
+          echo "::error::No RC tag found."
+          exit 1
+        fi
+
+        echo "Found RC tag: ${RC_TAG}"
+        echo "rc_tag=${RC_TAG}" >> "$GITHUB_OUTPUT"
+
+        RC_COMMIT="$(git rev-list -n 1 "${RC_TAG}")"
+
+        # Extract base version vX.Y.Z
+        FINAL_TAG="${RC_TAG%%-rc.*}"
+        echo "Final tag to create: ${FINAL_TAG}"
+
+        # Check if final tag already exists
+        if git rev-parse "${FINAL_TAG}" >/dev/null 2>&1; then
+          echo "::warning::Final tag ${FINAL_TAG} already exists. Skipping creation."
+          echo "final_version=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
+          echo "already_exists=true" >> "$GITHUB_OUTPUT"
+          echo "platforms=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "already_exists=false" >> "$GITHUB_OUTPUT"
+
+        # Extract platform from tag annotation
+        TAG_MSG="$(git for-each-ref "refs/tags/${RC_TAG}" --format='%(contents)' || true)"
+        PLATFORM=""
+
+        if [[ -n "${TAG_MSG}" ]]; then
+          PLATFORM="$(printf '%s\n' "${TAG_MSG}" \
+            | awk -F':' 'tolower($1) ~ /platforms/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print tolower($2); exit}')"
+        fi
+
+        # Fallback: try release body
+        if [[ -z "${PLATFORM}" ]]; then
+          echo "No platform in tag annotation. Trying release body fallback..."
+          BODY="$(gh release view "${RC_TAG}" --json body -q .body 2>/dev/null || true)"
+          if [[ -n "${BODY}" ]]; then
+            PLATFORM="$(printf '%s\n' "${BODY}" \
+              | awk -F':' 'tolower($1) ~ /platforms/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print tolower($2); exit}')"
+          fi
+        fi
+
+        case "${PLATFORM}" in
+          mobile|web|all) ;;
+          *) PLATFORM="all" ;;
+        esac
+
+        echo "Platforms: ${PLATFORM}"
+        echo "platforms=${PLATFORM}" >> "$GITHUB_OUTPUT"
+
+        # Create annotated tag
+        git config user.name "${GIT_USER_NAME}"
+        git config user.email "${GIT_USER_EMAIL}"
+        git tag -a "${FINAL_TAG}" "${RC_COMMIT}" -m "platforms: ${PLATFORM}"
+        git push origin "${FINAL_TAG}"
+
+        echo "Final tag ${FINAL_TAG} created and pushed (platforms: ${PLATFORM})."
+        echo "final_version=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
+
+    - name: Job Summary
+      if: always()
+      shell: bash
+      env:
+        FINAL_VERSION: ${{ steps.finalize.outputs.final_version }}
+        RC_TAG: ${{ steps.finalize.outputs.rc_tag }}
+        PLATFORMS: ${{ steps.finalize.outputs.platforms }}
+        ALREADY_EXISTS: ${{ steps.finalize.outputs.already_exists }}
+      run: |
+        {
+          echo "## Promote RC Summary"
+          echo ""
+          echo "| Field | Value |"
+          echo "|-------|-------|"
+          echo "| RC Tag | \`${RC_TAG:-N/A}\` |"
+          echo "| Final Version | \`${FINAL_VERSION:-N/A}\` |"
+          echo "| Platforms | ${PLATFORMS:-N/A} |"
+          echo "| Already Existed | ${ALREADY_EXISTS:-N/A} |"
+        } >> "$GITHUB_STEP_SUMMARY"

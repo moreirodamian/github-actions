@@ -1,0 +1,199 @@
+name: "Generate Changelog & Create Release"
+description: "Generates a changelog from git history between tags and creates a GitHub Release. Supports platform filtering, configurable issue trackers, and RC detection."
+
+inputs:
+  draft_release:
+    description: "Publish the release as a draft (true/false)."
+    required: false
+    default: "false"
+  platforms:
+    description: "Platform scope: auto (detect from tag), mobile, web, or all."
+    required: false
+    default: "auto"
+  issue_tracker_url:
+    description: "Base URL for issue links (e.g. https://jira.example.com/browse/). Empty = no links."
+    required: false
+    default: ""
+  ticket_prefixes:
+    description: "Space-separated project prefixes to match (e.g. 'PROJ OPS'). Empty = match all."
+    required: false
+    default: ""
+  commit_format:
+    description: "Commit categorization format: 'labels' ([feature], [bug], etc.), 'conventional' (feat:, fix:, etc.), or 'none' (flat list)."
+    required: false
+    default: "labels"
+
+outputs:
+  changelog:
+    description: "The generated changelog in markdown"
+    value: ${{ steps.build_changelog.outputs.changelog }}
+  current_tag:
+    description: "The current (release) tag"
+    value: ${{ steps.tags_current.outputs.currentTag }}
+  previous_tag:
+    description: "The previous tag used for changelog diff"
+    value: ${{ steps.tags_previous.outputs.previousTag }}
+  is_rc:
+    description: "Whether this is a release candidate (true/false)"
+    value: ${{ steps.tags_current.outputs.is_rc }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Make script executable
+      shell: bash
+      run: chmod +x "${{ github.action_path }}/generate-changelog.sh"
+
+    - id: tags_current
+      name: Detect current tag and RC mode
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        currentTag="$(git describe --tags --abbrev=0)"
+        echo "Current tag: ${currentTag}"
+        echo "currentTag=${currentTag}" >> "$GITHUB_OUTPUT"
+
+        if [[ "${currentTag}" == *-rc.* ]]; then
+          echo "Detected Release Candidate"
+          echo "make_release_latest=false" >> "$GITHUB_OUTPUT"
+          echo "is_rc=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "Detected Final Release"
+          echo "make_release_latest=true" >> "$GITHUB_OUTPUT"
+          echo "is_rc=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - id: platforms
+      name: Resolve platforms
+      shell: bash
+      env:
+        PLATFORMS_INPUT: ${{ inputs.platforms }}
+        CURRENT_TAG: ${{ steps.tags_current.outputs.currentTag }}
+      run: |
+        set -euo pipefail
+
+        parse_platform() {
+          awk 'BEGIN{IGNORECASE=1}
+               /^platforms[[:space:]]*:/{
+                 sub(/^[^:]*:/,"",$0);
+                 gsub(/^[[:space:]]+|[[:space:]]+$/,"",$0);
+                 print tolower($0);
+                 exit
+               }'
+        }
+
+        RAW_LOWER="$(echo "${PLATFORMS_INPUT:-}" | tr '[:upper:]' '[:lower:]')"
+        case "${RAW_LOWER}" in
+          mobile|web|all)
+            echo "platforms=${RAW_LOWER}" >> "$GITHUB_OUTPUT"
+            echo "PLATFORMS=${RAW_LOWER}" >> "$GITHUB_ENV"
+            exit 0
+          ;;
+        esac
+
+        # Auto-detect from tag annotation
+        TAG_MSG="$(git for-each-ref "refs/tags/${CURRENT_TAG}" --format='%(contents)' || true)"
+        if [[ -n "${TAG_MSG//[[:space:]]/}" ]]; then
+          ANN="$(printf '%s\n' "${TAG_MSG}" | tr -d '\r' | parse_platform || true)"
+          case "${ANN}" in
+            mobile|web|all)
+              echo "platforms=${ANN}" >> "$GITHUB_OUTPUT"
+              echo "PLATFORMS=${ANN}" >> "$GITHUB_ENV"
+              exit 0
+            ;;
+          esac
+        fi
+
+        echo "platforms=all" >> "$GITHUB_OUTPUT"
+        echo "PLATFORMS=all" >> "$GITHUB_ENV"
+
+    - id: tags_previous
+      name: Find previous tag
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CURRENT_TAG: ${{ steps.tags_current.outputs.currentTag }}
+        PLATFORM: ${{ steps.platforms.outputs.platforms }}
+      run: |
+        set -euo pipefail
+
+        REPO="${GITHUB_REPOSITORY}"
+
+        case "${PLATFORM}" in
+          mobile) plat_regex="^platforms:[[:space:]]*(mobile|all)\\b" ;;
+          web)    plat_regex="^platforms:[[:space:]]*(web|all)\\b" ;;
+          *)      plat_regex="^platforms:[[:space:]]*(mobile|web|all)\\b" ;;
+        esac
+
+        # Try finding platform-compatible previous release via API
+        PREV=""
+        JSON="$(gh api -H "Accept: application/vnd.github+json" \
+          "/repos/${REPO}/releases?per_page=200" 2>/dev/null || echo "[]")"
+
+        if [[ "${JSON}" != "[]" ]]; then
+          PREV="$(echo "${JSON}" | jq -r --arg CUR "${CURRENT_TAG}" --arg RE "${plat_regex}" '
+            [ .[]
+              | select((.draft // false) | not)
+              | select(.tag_name != $CUR)
+              | select((.body // "") | test($RE; "im"))
+            ]
+            | sort_by(.created_at)
+            | (last // empty)
+            | .tag_name // empty
+          ' 2>/dev/null || true)"
+        fi
+
+        if [[ -z "${PREV}" ]]; then
+          echo "No platform-compatible release found. Falling back to chronological tag."
+          PREV="$(git --no-pager tag --sort=creatordate --merged | grep '^v' | grep -v -F "${CURRENT_TAG}" | tail -1 || true)"
+        fi
+
+        echo "previousTag=${PREV}"
+        echo "previousTag=${PREV}" >> "$GITHUB_OUTPUT"
+
+    - id: build_changelog
+      name: Build Changelog
+      shell: bash
+      env:
+        ISSUE_TRACKER_BASE_URL: ${{ inputs.issue_tracker_url }}
+        TICKET_PREFIXES: ${{ inputs.ticket_prefixes }}
+        COMMIT_FORMAT: ${{ inputs.commit_format }}
+      run: |
+        set -euo pipefail
+
+        PREV="${{ steps.tags_previous.outputs.previousTag }}"
+        CURR="${{ steps.tags_current.outputs.currentTag }}"
+        PLATFORM="${{ steps.platforms.outputs.platforms }}"
+
+        changelog="$("${{ github.action_path }}/generate-changelog.sh" "${PREV}" "${CURR}" "${PLATFORM}")"
+
+        {
+          echo "changelog<<CHANGELOG_EOF"
+          echo "${changelog}"
+          echo "CHANGELOG_EOF"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Create Release
+      uses: ncipollo/release-action@v1
+      with:
+        allowUpdates: false
+        draft: ${{ inputs.draft_release }}
+        makeLatest: ${{ steps.tags_current.outputs.make_release_latest }}
+        name: ${{ steps.tags_current.outputs.currentTag }}
+        body: ${{ steps.build_changelog.outputs.changelog }}
+        tag: ${{ steps.tags_current.outputs.currentTag }}
+
+    - name: Mark as pre-release if RC
+      if: ${{ steps.tags_current.outputs.is_rc == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CURRENT_TAG: ${{ steps.tags_current.outputs.currentTag }}
+      run: |
+        gh release edit "${CURRENT_TAG}" --prerelease

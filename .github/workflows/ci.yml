@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  validate:
+    name: Validate Actions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate YAML syntax
+        run: |
+          set -euo pipefail
+          echo "Validating action.yml files..."
+          errors=0
+          for f in */action.yml; do
+            if python3 -c "import yaml; yaml.safe_load(open('$f'))"; then
+              echo "  OK: $f"
+            else
+              echo "  FAIL: $f"
+              errors=$((errors + 1))
+            fi
+          done
+          if [ "$errors" -gt 0 ]; then
+            echo "::error::$errors action.yml file(s) failed YAML validation"
+            exit 1
+          fi
+
+      - name: ShellCheck
+        run: |
+          set -euo pipefail
+          echo "Running ShellCheck..."
+          shopt -s globstar nullglob
+          files=(**/*.sh)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No shell scripts found"
+            exit 0
+          fi
+          shellcheck "${files[@]}"
+          echo "ShellCheck passed for ${#files[@]} file(s)"
+
+      - name: actionlint
+        uses: reviewdog/action-actionlint@v1
+        with:
+          fail_on_error: true
+
+      - name: No client-specific strings
+        run: |
+          set -euo pipefail
+          echo "Checking for client-specific strings..."
+          if grep -ri "kodear\|4piot\|treasuregame\|linear\.app\|atlassian\.net" \
+            --include="*.yml" --include="*.sh" \
+            --exclude-dir=.git --exclude-dir=.github \
+            . ; then
+            echo "::error::Found client-specific strings in the repository"
+            exit 1
+          fi
+          echo "No client-specific strings found"

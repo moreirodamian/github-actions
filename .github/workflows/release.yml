@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create Release & Floating Tags
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate tag format
+        id: tag
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Tag '$TAG' does not match vX.Y.Z format"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Extract major and minor for floating tags
+          MAJOR="${TAG%%.*}"
+          MINOR="${TAG%.*}"
+          echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
+          echo "minor=$MINOR" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          generateReleaseNotes: true
+          makeLatest: true
+          name: ${{ steps.tag.outputs.tag }}
+          tag: ${{ steps.tag.outputs.tag }}
+
+      - name: Update floating tags
+        run: |
+          set -euo pipefail
+          MAJOR="${{ steps.tag.outputs.major }}"
+          MINOR="${{ steps.tag.outputs.minor }}"
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          # Update v1 (major floating tag)
+          git tag -fa "$MAJOR" -m "Floating tag $MAJOR -> ${{ steps.tag.outputs.tag }}"
+          git push origin "$MAJOR" --force
+
+          # Update v1.2 (minor floating tag)
+          git tag -fa "$MINOR" -m "Floating tag $MINOR -> ${{ steps.tag.outputs.tag }}"
+          git push origin "$MINOR" --force
+
+          echo "Updated floating tags: $MAJOR, $MINOR -> ${{ steps.tag.outputs.tag }}"

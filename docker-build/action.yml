@@ -1,0 +1,233 @@
+name: "Docker Build & Push"
+description: "Builds and pushes Docker images using buildx. Supports multi-registry, multi-platform, multi-target, GHA cache, and provenance/SBOM."
+
+inputs:
+  repository:
+    description: "Full image repository (e.g. ghcr.io/org/app, docker.io/org/app, 123456.dkr.ecr.us-east-1.amazonaws.com/app)."
+    required: true
+  username:
+    description: "Registry username."
+    required: true
+  password:
+    description: "Registry password or token."
+    required: true
+  tag:
+    description: "Tag to apply (e.g. 1.4.2). If empty, 'latest' is used."
+    required: false
+    default: ""
+  dockerfile_path:
+    description: "Path to Dockerfile."
+    required: false
+    default: "Dockerfile"
+  build_context:
+    description: "Docker build context directory."
+    required: false
+    default: "."
+  target:
+    description: "Docker build target(s). Comma-separated for multi-target (e.g. 'cli,fpm')."
+    required: false
+    default: ""
+  custom_arguments:
+    description: "Extra docker build arguments (e.g. '--build-arg FOO=bar')."
+    required: false
+    default: ""
+  platforms:
+    description: "Comma-separated target platforms (e.g. 'linux/amd64,linux/arm64')."
+    required: false
+    default: "linux/amd64"
+  push_latest:
+    description: "Also push a 'latest' tag (true/false)."
+    required: false
+    default: "false"
+  provenance:
+    description: "Enable SLSA provenance attestation (true/false)."
+    required: false
+    default: "false"
+  sbom:
+    description: "Enable SBOM generation (true/false)."
+    required: false
+    default: "false"
+  cache_enabled:
+    description: "Enable GitHub Actions build cache (true/false)."
+    required: false
+    default: "true"
+
+outputs:
+  image:
+    description: "Repository image name"
+    value: ${{ steps.meta.outputs.image }}
+  tags:
+    description: "Comma-separated list of all pushed image:tag combinations"
+    value: ${{ steps.result.outputs.tags }}
+  digest:
+    description: "Image digest (sha256) of the last pushed image"
+    value: ${{ steps.result.outputs.digest }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Resolve metadata
+      id: meta
+      shell: bash
+      env:
+        REPO: ${{ inputs.repository }}
+        TAG_INPUT: ${{ inputs.tag }}
+      run: |
+        set -euo pipefail
+        TAG="$(echo "${TAG_INPUT:-}" | xargs || true)"
+        if [[ -z "${TAG}" ]]; then
+          TAG="latest"
+        fi
+        echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+        echo "image=${REPO}" >> "$GITHUB_OUTPUT"
+
+        # Detect registry type for login
+        if [[ "${REPO}" == *".dkr.ecr."* ]]; then
+          echo "registry_type=ecr" >> "$GITHUB_OUTPUT"
+          REGISTRY="$(echo "${REPO}" | cut -d'/' -f1)"
+        elif [[ "${REPO}" == ghcr.io/* ]]; then
+          echo "registry_type=ghcr" >> "$GITHUB_OUTPUT"
+          REGISTRY="ghcr.io"
+        elif [[ "${REPO}" == *".azurecr.io/"* ]]; then
+          echo "registry_type=acr" >> "$GITHUB_OUTPUT"
+          REGISTRY="$(echo "${REPO}" | cut -d'/' -f1)"
+        else
+          echo "registry_type=dockerhub" >> "$GITHUB_OUTPUT"
+          REGISTRY="docker.io"
+        fi
+        echo "registry=${REGISTRY}" >> "$GITHUB_OUTPUT"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Docker Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ steps.meta.outputs.registry }}
+        username: ${{ inputs.username }}
+        password: ${{ inputs.password }}
+
+    - name: Build & Push
+      id: result
+      shell: bash
+      env:
+        REPO: ${{ inputs.repository }}
+        TAG: ${{ steps.meta.outputs.tag }}
+        DOCKERFILE: ${{ inputs.dockerfile_path }}
+        BUILD_CONTEXT: ${{ inputs.build_context }}
+        TARGETS: ${{ inputs.target }}
+        CUSTOM_ARGS: ${{ inputs.custom_arguments }}
+        PLATFORMS: ${{ inputs.platforms }}
+        PUSH_LATEST: ${{ inputs.push_latest }}
+        PROVENANCE: ${{ inputs.provenance }}
+        SBOM: ${{ inputs.sbom }}
+        CACHE_ENABLED: ${{ inputs.cache_enabled }}
+      run: |
+        set -euo pipefail
+
+        # Parse targets
+        RAW_TRIM="$(echo "${TARGETS:-}" | xargs || true)"
+        if [[ -z "${RAW_TRIM}" ]]; then
+          RAW_TARGETS=("")
+        else
+          IFS=',' read -r -a RAW_TARGETS <<< "${RAW_TRIM}"
+        fi
+
+        all_tags=()
+        last_digest=""
+
+        for t in "${RAW_TARGETS[@]}"; do
+          t_trim="$(echo "${t}" | xargs || true)"
+
+          # Build tag list for this target
+          TAGS=()
+          if [[ -n "${t_trim}" ]]; then
+            TAGS+=("${REPO}:${t_trim}-${TAG}")
+            if [[ "${PUSH_LATEST}" == "true" ]]; then
+              TAGS+=("${REPO}:${t_trim}-latest")
+            fi
+          else
+            TAGS+=("${REPO}:${TAG}")
+            if [[ "${PUSH_LATEST}" == "true" && "${TAG}" != "latest" ]]; then
+              TAGS+=("${REPO}:latest")
+            fi
+          fi
+
+          echo ">> Building: ${TAGS[*]}"
+
+          # Build buildx command as array
+          CMD=(docker buildx build)
+          CMD+=(--file "${DOCKERFILE}")
+          CMD+=(--platform "${PLATFORMS}")
+          CMD+=(--push)
+
+          if [[ -n "${t_trim}" ]]; then
+            CMD+=(--target "${t_trim}")
+          fi
+
+          for img_tag in "${TAGS[@]}"; do
+            CMD+=(--tag "${img_tag}")
+          done
+
+          # Cache
+          if [[ "${CACHE_ENABLED}" == "true" ]]; then
+            CMD+=(--cache-from "type=gha,scope=${t_trim:-default}")
+            CMD+=(--cache-to "type=gha,mode=max,scope=${t_trim:-default}")
+          fi
+
+          # Provenance & SBOM
+          if [[ "${PROVENANCE}" == "true" ]]; then
+            CMD+=(--provenance=true)
+          else
+            CMD+=(--provenance=false)
+          fi
+          if [[ "${SBOM}" == "true" ]]; then
+            CMD+=(--sbom=true)
+          fi
+
+          # Custom arguments
+          CUSTOM_TRIM="$(echo "${CUSTOM_ARGS:-}" | xargs || true)"
+          if [[ -n "${CUSTOM_TRIM}" ]]; then
+            # shellcheck disable=SC2206
+            CMD+=(${CUSTOM_TRIM})
+          fi
+
+          CMD+=("${BUILD_CONTEXT}")
+
+          # Execute
+          echo ">> Command: ${CMD[*]}"
+          BUILD_OUTPUT="$("${CMD[@]}" 2>&1 | tee /dev/stderr)" || {
+            echo "::error::Build failed for target: ${t_trim:-default}"
+            exit 1
+          }
+
+          # Extract digest
+          DIGEST="$(echo "${BUILD_OUTPUT}" | grep -oP 'sha256:[a-f0-9]{64}' | tail -1 || true)"
+          if [[ -n "${DIGEST}" ]]; then
+            last_digest="${DIGEST}"
+          fi
+
+          for img_tag in "${TAGS[@]}"; do
+            all_tags+=("${img_tag}")
+          done
+        done
+
+        TAGS_CSV="$(IFS=','; echo "${all_tags[*]}")"
+        echo "tags=${TAGS_CSV}" >> "$GITHUB_OUTPUT"
+        echo "digest=${last_digest}" >> "$GITHUB_OUTPUT"
+
+        # Job Summary
+        {
+          echo "## Docker Build Summary"
+          echo ""
+          echo "| Field | Value |"
+          echo "|-------|-------|"
+          echo "| Repository | \`${REPO}\` |"
+          echo "| Platforms | \`${PLATFORMS}\` |"
+          echo "| Digest | \`${last_digest:-N/A}\` |"
+          echo ""
+          echo "### Tags Pushed"
+          for img_tag in "${all_tags[@]}"; do
+            echo "- \`${img_tag}\`"
+          done
+        } >> "$GITHUB_STEP_SUMMARY"
