@@ -1,9 +1,21 @@
 name: "Promote RC to Final Release"
-description: "Creates a final release tag (vX.Y.Z) from an RC tag (vX.Y.Z-rc.N), combines changelogs from all RCs in the cycle, and converts the latest RC release into the final release (preserving its assets)."
+description: "Creates a final release tag (vX.Y.Z) from an RC tag (vX.Y.Z-rc.N), regenerates a clean changelog from git history (prev_final → new_final), and converts the latest RC release into the final release (preserving its assets)."
 
 inputs:
   rc_tag:
-    description: "Specific RC tag to promote (e.g. v1.2.3-rc.2). If empty, uses the latest RC tag. All RCs with number ≤ the selected RC are combined into the changelog; the selected RC's release becomes the final release (its assets are preserved)."
+    description: "Specific RC tag to promote (e.g. v1.2.3-rc.2). If empty, uses the latest RC tag. The final release body is regenerated from git history between the previous platform-compatible final tag and the selected RC commit (the same generator used by generate-release)."
+    required: false
+    default: ""
+  commit_format:
+    description: "Commit categorization format passed to generate-changelog.sh: 'labels' (default), 'conventional', or 'none'."
+    required: false
+    default: "labels"
+  issue_tracker_url:
+    description: "Base URL for issue links (e.g. https://jira.example.com/browse/). Empty = no links."
+    required: false
+    default: ""
+  ticket_prefixes:
+    description: "Space-separated project prefixes to match in tickets (e.g. 'PROJ OPS'). Empty = match all."
     required: false
     default: ""
   git_user_name:
@@ -28,26 +40,30 @@ outputs:
   already_exists:
     description: "Whether the final tag already existed (true/false)"
     value: ${{ steps.finalize.outputs.already_exists }}
-  combined_rcs:
-    description: "Comma-separated list of RC tags combined into the final changelog"
-    value: ${{ steps.finalize.outputs.combined_rcs }}
+  previous_final_tag:
+    description: "The previous platform-compatible final tag used as the changelog base"
+    value: ${{ steps.finalize.outputs.previous_final_tag }}
 
 runs:
   using: "composite"
   steps:
-    - name: Checkout code
+    - name: Checkout consumer repo
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
     - id: finalize
-      name: Create final tag from RC and combine changelogs
+      name: Create final tag from RC and regenerate clean changelog
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
         RC_TAG_INPUT: ${{ inputs.rc_tag }}
         GIT_USER_NAME: ${{ inputs.git_user_name }}
         GIT_USER_EMAIL: ${{ inputs.git_user_email }}
+        COMMIT_FORMAT: ${{ inputs.commit_format }}
+        ISSUE_TRACKER_BASE_URL: ${{ inputs.issue_tracker_url }}
+        TICKET_PREFIXES: ${{ inputs.ticket_prefixes }}
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
 
@@ -75,12 +91,11 @@ runs:
 
         RC_COMMIT="$(git rev-list -n 1 "${RC_TAG}")"
 
-        # Extract base version vX.Y.Z and the RC number
+        # Extract base version vX.Y.Z
         FINAL_TAG="${RC_TAG%%-rc.*}"
-        RC_NUMBER="${RC_TAG##*-rc.}"
-        echo "Final tag to create: ${FINAL_TAG} (cutoff RC: rc.${RC_NUMBER})"
+        echo "Final tag to create: ${FINAL_TAG}"
 
-        # Extract platform from RC tag annotation (or body) early — needed in both branches
+        # ── Resolve platforms (from RC tag annotation, fallback to release body)
         TAG_MSG="$(git for-each-ref "refs/tags/${RC_TAG}" --format='%(contents)' || true)"
         PLATFORM=""
         if [[ -n "${TAG_MSG}" ]]; then
@@ -101,90 +116,83 @@ runs:
         echo "Platforms: ${PLATFORM}"
         echo "platforms=${PLATFORM}" >> "$GITHUB_OUTPUT"
 
-        # List all RC tags for this base version with number <= RC_NUMBER, sorted ascending
-        ALL_RCS=()
-        while IFS= read -r t; do
-          [[ -z "$t" ]] && continue
-          n="${t##*-rc.}"
-          if [[ "$n" =~ ^[0-9]+$ ]] && (( n <= RC_NUMBER )); then
-            ALL_RCS+=("$t")
-          fi
-        done < <(git tag -l "${FINAL_TAG}-rc.*" | sort -t. -k4 -n)
+        # ── Find previous platform-compatible final release (same logic as generate-release/action.yml)
+        REPO="${GITHUB_REPOSITORY}"
+        case "${PLATFORM}" in
+          mobile) plat_regex="^platforms:[[:space:]]*(mobile|all)\\b" ;;
+          web)    plat_regex="^platforms:[[:space:]]*(web|all)\\b" ;;
+          *)      plat_regex="^platforms:[[:space:]]*(mobile|web|all)\\b" ;;
+        esac
 
-        if [[ ${#ALL_RCS[@]} -eq 0 ]]; then
-          echo "::error::No RC tags found for ${FINAL_TAG}"
-          exit 1
+        PREV_FINAL=""
+        JSON="$(gh api -H "Accept: application/vnd.github+json" \
+          "/repos/${REPO}/releases?per_page=200" 2>/dev/null || echo "[]")"
+
+        if [[ "${JSON}" != "[]" ]]; then
+          PREV_FINAL="$(echo "${JSON}" | jq -r --arg CUR "${FINAL_TAG}" --arg RC "${RC_TAG}" --arg RE "${plat_regex}" '
+            [ .[]
+              | select((.draft // false) | not)
+              | select((.prerelease // false) | not)
+              | select(.tag_name != $CUR and .tag_name != $RC)
+              | select((.tag_name | test("-rc\\.[0-9]+$")) | not)
+              | select((.body // "") | test($RE; "im"))
+            ]
+            | sort_by(.created_at)
+            | (last // empty)
+            | .tag_name // empty
+          ' 2>/dev/null || true)"
         fi
 
-        echo "Combining changelogs from ${#ALL_RCS[@]} RC(s): ${ALL_RCS[*]}"
-        printf -v COMBINED_RCS_CSV '%s,' "${ALL_RCS[@]}"
-        COMBINED_RCS_CSV="${COMBINED_RCS_CSV%,}"
-        echo "combined_rcs=${COMBINED_RCS_CSV}" >> "$GITHUB_OUTPUT"
+        if [[ -z "${PREV_FINAL}" ]]; then
+          echo "No platform-compatible previous final release found. Falling back to chronological tag."
+          PREV_FINAL="$(git --no-pager tag --sort=creatordate --merged "${RC_COMMIT}" \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | grep -v -F "${FINAL_TAG}" \
+            | tail -1 || true)"
+        fi
 
-        # Build combined release notes
-        REPO="${GITHUB_REPOSITORY:-}"
-        NOTES_FILE="$(mktemp)"
-        {
-          echo "# ${FINAL_TAG}"
-          echo ""
-          if [[ ${#ALL_RCS[@]} -gt 1 ]]; then
-            RC_LIST="$(printf 'rc.%s, ' "${ALL_RCS[@]##*-rc.}")"
-            RC_LIST="${RC_LIST%, }"
-            echo "> **Combined from ${#ALL_RCS[@]} release candidates:** ${RC_LIST}"
-            echo ""
-          fi
-          echo "platforms: ${PLATFORM}"
-          echo ""
-          echo "---"
-          echo ""
-          for rc in "${ALL_RCS[@]}"; do
-            RC_BODY="$(gh release view "$rc" --json body -q .body 2>/dev/null || true)"
-            if [[ -z "${RC_BODY}" ]]; then
-              echo "## ${rc}"
-              echo ""
-              echo "_No release notes available for this candidate._"
-              echo ""
-              echo "---"
-              echo ""
-              continue
-            fi
-            if [[ ${#ALL_RCS[@]} -gt 1 ]]; then
-              echo "## ${rc}"
-              echo ""
-              # Strip the RC's own H1 title line so we don't duplicate it
-              printf '%s\n' "${RC_BODY}" | sed -E '1{/^# v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?( .*)?$/d;}'
-            else
-              printf '%s\n' "${RC_BODY}"
-            fi
-            echo ""
-            echo "---"
-            echo ""
-          done
-        } > "${NOTES_FILE}"
-        echo "Combined notes written to ${NOTES_FILE} ($(wc -l < "${NOTES_FILE}") lines)"
+        echo "Previous final tag: ${PREV_FINAL:-<none>}"
+        echo "previous_final_tag=${PREV_FINAL}" >> "$GITHUB_OUTPUT"
 
-        # Configure git identity (used for tag + potential idempotent re-runs)
+        # ── Configure git identity (used for tag creation)
         git config user.name "${GIT_USER_NAME}"
         git config user.email "${GIT_USER_EMAIL}"
 
-        # Check if final tag already exists (idempotency check)
+        # ── Idempotency: skip if final tag already exists
         if git rev-parse "${FINAL_TAG}" >/dev/null 2>&1; then
           echo "::warning::Final tag ${FINAL_TAG} already exists. Skipping promotion."
           echo "final_version=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
           echo "already_exists=true" >> "$GITHUB_OUTPUT"
-          rm -f "${NOTES_FILE}"
           exit 0
         fi
-
         echo "already_exists=false" >> "$GITHUB_OUTPUT"
 
-        # Create final annotated tag pointing at the RC commit
+        # ── Create final annotated tag pointing at the RC commit (BEFORE running changelog
+        # so generate-changelog.sh can resolve CURR_TAG with `git log ... ${FINAL_TAG}`)
         git tag -a "${FINAL_TAG}" "${RC_COMMIT}" -m "platforms: ${PLATFORM}"
         git push origin "${FINAL_TAG}"
-        echo "Final tag ${FINAL_TAG} created and pushed at ${RC_COMMIT} (platforms: ${PLATFORM})."
+        echo "Final tag ${FINAL_TAG} created and pushed at ${RC_COMMIT}."
 
-        # Convert the RC release into the final release: rename tag, replace body, mark as latest.
-        # Assets attached to the RC release are preserved by `gh release edit`.
+        # ── Generate clean changelog using sibling action's script (downloaded by Actions runtime)
+        CHANGELOG_SCRIPT="${ACTION_PATH}/../generate-release/generate-changelog.sh"
+        if [[ ! -f "${CHANGELOG_SCRIPT}" ]]; then
+          echo "::error::generate-changelog.sh not found at ${CHANGELOG_SCRIPT}"
+          exit 1
+        fi
+        chmod +x "${CHANGELOG_SCRIPT}" || true
+
+        NOTES_FILE="$(mktemp)"
+        if [[ -n "${PREV_FINAL}" ]]; then
+          "${CHANGELOG_SCRIPT}" "${PREV_FINAL}" "${FINAL_TAG}" "${PLATFORM}" > "${NOTES_FILE}"
+        else
+          echo "::warning::No previous final tag — generating changelog against root commit."
+          ROOT_COMMIT="$(git rev-list --max-parents=0 HEAD | tail -1)"
+          "${CHANGELOG_SCRIPT}" "${ROOT_COMMIT}" "${FINAL_TAG}" "${PLATFORM}" > "${NOTES_FILE}"
+        fi
+        echo "Changelog generated ($(wc -l < "${NOTES_FILE}") lines)."
+
+        # ── Convert the RC release into the final release: rename tag, replace body,
+        # mark as latest. Assets attached to the RC release are preserved by `gh release edit`.
         if gh release view "${RC_TAG}" >/dev/null 2>&1; then
           gh release edit "${RC_TAG}" \
             --tag "${FINAL_TAG}" \
@@ -192,7 +200,7 @@ runs:
             --notes-file "${NOTES_FILE}" \
             --prerelease=false \
             --latest
-          echo "Converted release ${RC_TAG} into ${FINAL_TAG} (combined changelog, assets preserved)."
+          echo "Converted release ${RC_TAG} into ${FINAL_TAG} (clean changelog, assets preserved)."
         else
           echo "::warning::No GitHub Release for ${RC_TAG} — creating final release without assets."
           gh release create "${FINAL_TAG}" \
@@ -212,7 +220,7 @@ runs:
         RC_TAG: ${{ steps.finalize.outputs.rc_tag }}
         PLATFORMS: ${{ steps.finalize.outputs.platforms }}
         ALREADY_EXISTS: ${{ steps.finalize.outputs.already_exists }}
-        COMBINED_RCS: ${{ steps.finalize.outputs.combined_rcs }}
+        PREV_FINAL: ${{ steps.finalize.outputs.previous_final_tag }}
       run: |
         {
           echo "## Promote RC Summary"
@@ -221,7 +229,7 @@ runs:
           echo "|-------|-------|"
           echo "| RC Tag | \`${RC_TAG:-N/A}\` |"
           echo "| Final Version | \`${FINAL_VERSION:-N/A}\` |"
+          echo "| Previous Final | \`${PREV_FINAL:-<none>}\` |"
           echo "| Platforms | ${PLATFORMS:-N/A} |"
           echo "| Already Existed | ${ALREADY_EXISTS:-N/A} |"
-          echo "| Combined RCs | ${COMBINED_RCS:-N/A} |"
         } >> "$GITHUB_STEP_SUMMARY"

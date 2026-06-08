@@ -313,7 +313,8 @@ release_notes_file="$(mktemp)"
   # Compare link
   echo "---"
   echo ""
-  echo "**Full diff:** [\`${PREV_TAG}...${CURR_TAG}\`](https://github.com/\${GITHUB_REPOSITORY:-owner/repo}/compare/${PREV_TAG}...${CURR_TAG})"
+  REPO_SLUG="${GITHUB_REPOSITORY:-owner/repo}"
+  echo "**Full diff:** [\`${PREV_TAG}...${CURR_TAG}\`](https://github.com/${REPO_SLUG}/compare/${PREV_TAG}...${CURR_TAG})"
 
 } > "${release_notes_file}"
 
