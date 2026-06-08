@@ -1,9 +1,9 @@
 name: "Promote RC to Final Release"
-description: "Creates a final release tag (vX.Y.Z) from an RC tag (vX.Y.Z-rc.N), preserving platform annotation."
+description: "Creates a final release tag (vX.Y.Z) from an RC tag (vX.Y.Z-rc.N), combines changelogs from all RCs in the cycle, and converts the latest RC release into the final release (preserving its assets)."
 
 inputs:
   rc_tag:
-    description: "Specific RC tag to promote (e.g. v1.2.3-rc.2). If empty, uses the latest RC tag."
+    description: "Specific RC tag to promote (e.g. v1.2.3-rc.2). If empty, uses the latest RC tag. All RCs with number ≤ the selected RC are combined into the changelog; the selected RC's release becomes the final release (its assets are preserved)."
     required: false
     default: ""
   git_user_name:
@@ -28,6 +28,9 @@ outputs:
   already_exists:
     description: "Whether the final tag already existed (true/false)"
     value: ${{ steps.finalize.outputs.already_exists }}
+  combined_rcs:
+    description: "Comma-separated list of RC tags combined into the final changelog"
+    value: ${{ steps.finalize.outputs.combined_rcs }}
 
 runs:
   using: "composite"
@@ -38,7 +41,7 @@ runs:
         fetch-depth: 0
 
     - id: finalize
-      name: Create final tag from RC
+      name: Create final tag from RC and combine changelogs
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
@@ -62,61 +65,144 @@ runs:
           exit 1
         fi
 
+        if [[ ! "${RC_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+          echo "::error::Invalid RC tag format: ${RC_TAG} (expected vX.Y.Z-rc.N)"
+          exit 1
+        fi
+
         echo "Found RC tag: ${RC_TAG}"
         echo "rc_tag=${RC_TAG}" >> "$GITHUB_OUTPUT"
 
         RC_COMMIT="$(git rev-list -n 1 "${RC_TAG}")"
 
-        # Extract base version vX.Y.Z
+        # Extract base version vX.Y.Z and the RC number
         FINAL_TAG="${RC_TAG%%-rc.*}"
-        echo "Final tag to create: ${FINAL_TAG}"
+        RC_NUMBER="${RC_TAG##*-rc.}"
+        echo "Final tag to create: ${FINAL_TAG} (cutoff RC: rc.${RC_NUMBER})"
 
-        # Check if final tag already exists
-        if git rev-parse "${FINAL_TAG}" >/dev/null 2>&1; then
-          echo "::warning::Final tag ${FINAL_TAG} already exists. Skipping creation."
-          echo "final_version=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
-          echo "already_exists=true" >> "$GITHUB_OUTPUT"
-          echo "platforms=" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-
-        echo "already_exists=false" >> "$GITHUB_OUTPUT"
-
-        # Extract platform from tag annotation
+        # Extract platform from RC tag annotation (or body) early — needed in both branches
         TAG_MSG="$(git for-each-ref "refs/tags/${RC_TAG}" --format='%(contents)' || true)"
         PLATFORM=""
-
         if [[ -n "${TAG_MSG}" ]]; then
           PLATFORM="$(printf '%s\n' "${TAG_MSG}" \
             | awk -F':' 'tolower($1) ~ /platforms/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print tolower($2); exit}')"
         fi
-
-        # Fallback: try release body
         if [[ -z "${PLATFORM}" ]]; then
-          echo "No platform in tag annotation. Trying release body fallback..."
           BODY="$(gh release view "${RC_TAG}" --json body -q .body 2>/dev/null || true)"
           if [[ -n "${BODY}" ]]; then
             PLATFORM="$(printf '%s\n' "${BODY}" \
               | awk -F':' 'tolower($1) ~ /platforms/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print tolower($2); exit}')"
           fi
         fi
-
         case "${PLATFORM}" in
           mobile|web|all) ;;
           *) PLATFORM="all" ;;
         esac
-
         echo "Platforms: ${PLATFORM}"
         echo "platforms=${PLATFORM}" >> "$GITHUB_OUTPUT"
 
-        # Create annotated tag
+        # List all RC tags for this base version with number <= RC_NUMBER, sorted ascending
+        ALL_RCS=()
+        while IFS= read -r t; do
+          [[ -z "$t" ]] && continue
+          n="${t##*-rc.}"
+          if [[ "$n" =~ ^[0-9]+$ ]] && (( n <= RC_NUMBER )); then
+            ALL_RCS+=("$t")
+          fi
+        done < <(git tag -l "${FINAL_TAG}-rc.*" | sort -t. -k4 -n)
+
+        if [[ ${#ALL_RCS[@]} -eq 0 ]]; then
+          echo "::error::No RC tags found for ${FINAL_TAG}"
+          exit 1
+        fi
+
+        echo "Combining changelogs from ${#ALL_RCS[@]} RC(s): ${ALL_RCS[*]}"
+        printf -v COMBINED_RCS_CSV '%s,' "${ALL_RCS[@]}"
+        COMBINED_RCS_CSV="${COMBINED_RCS_CSV%,}"
+        echo "combined_rcs=${COMBINED_RCS_CSV}" >> "$GITHUB_OUTPUT"
+
+        # Build combined release notes
+        REPO="${GITHUB_REPOSITORY:-}"
+        NOTES_FILE="$(mktemp)"
+        {
+          echo "# ${FINAL_TAG}"
+          echo ""
+          if [[ ${#ALL_RCS[@]} -gt 1 ]]; then
+            RC_LIST="$(printf 'rc.%s, ' "${ALL_RCS[@]##*-rc.}")"
+            RC_LIST="${RC_LIST%, }"
+            echo "> **Combined from ${#ALL_RCS[@]} release candidates:** ${RC_LIST}"
+            echo ""
+          fi
+          echo "platforms: ${PLATFORM}"
+          echo ""
+          echo "---"
+          echo ""
+          for rc in "${ALL_RCS[@]}"; do
+            RC_BODY="$(gh release view "$rc" --json body -q .body 2>/dev/null || true)"
+            if [[ -z "${RC_BODY}" ]]; then
+              echo "## ${rc}"
+              echo ""
+              echo "_No release notes available for this candidate._"
+              echo ""
+              echo "---"
+              echo ""
+              continue
+            fi
+            if [[ ${#ALL_RCS[@]} -gt 1 ]]; then
+              echo "## ${rc}"
+              echo ""
+              # Strip the RC's own H1 title line so we don't duplicate it
+              printf '%s\n' "${RC_BODY}" | sed -E '1{/^# v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?( .*)?$/d;}'
+            else
+              printf '%s\n' "${RC_BODY}"
+            fi
+            echo ""
+            echo "---"
+            echo ""
+          done
+        } > "${NOTES_FILE}"
+        echo "Combined notes written to ${NOTES_FILE} ($(wc -l < "${NOTES_FILE}") lines)"
+
+        # Configure git identity (used for tag + potential idempotent re-runs)
         git config user.name "${GIT_USER_NAME}"
         git config user.email "${GIT_USER_EMAIL}"
+
+        # Check if final tag already exists (idempotency check)
+        if git rev-parse "${FINAL_TAG}" >/dev/null 2>&1; then
+          echo "::warning::Final tag ${FINAL_TAG} already exists. Skipping promotion."
+          echo "final_version=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
+          echo "already_exists=true" >> "$GITHUB_OUTPUT"
+          rm -f "${NOTES_FILE}"
+          exit 0
+        fi
+
+        echo "already_exists=false" >> "$GITHUB_OUTPUT"
+
+        # Create final annotated tag pointing at the RC commit
         git tag -a "${FINAL_TAG}" "${RC_COMMIT}" -m "platforms: ${PLATFORM}"
         git push origin "${FINAL_TAG}"
+        echo "Final tag ${FINAL_TAG} created and pushed at ${RC_COMMIT} (platforms: ${PLATFORM})."
 
-        echo "Final tag ${FINAL_TAG} created and pushed (platforms: ${PLATFORM})."
+        # Convert the RC release into the final release: rename tag, replace body, mark as latest.
+        # Assets attached to the RC release are preserved by `gh release edit`.
+        if gh release view "${RC_TAG}" >/dev/null 2>&1; then
+          gh release edit "${RC_TAG}" \
+            --tag "${FINAL_TAG}" \
+            --title "${FINAL_TAG}" \
+            --notes-file "${NOTES_FILE}" \
+            --prerelease=false \
+            --latest
+          echo "Converted release ${RC_TAG} into ${FINAL_TAG} (combined changelog, assets preserved)."
+        else
+          echo "::warning::No GitHub Release for ${RC_TAG} — creating final release without assets."
+          gh release create "${FINAL_TAG}" \
+            --title "${FINAL_TAG}" \
+            --notes-file "${NOTES_FILE}" \
+            --latest
+        fi
+
         echo "final_version=${FINAL_TAG}" >> "$GITHUB_OUTPUT"
+        rm -f "${NOTES_FILE}"
 
     - name: Job Summary
       if: always()
@@ -126,6 +212,7 @@ runs:
         RC_TAG: ${{ steps.finalize.outputs.rc_tag }}
         PLATFORMS: ${{ steps.finalize.outputs.platforms }}
         ALREADY_EXISTS: ${{ steps.finalize.outputs.already_exists }}
+        COMBINED_RCS: ${{ steps.finalize.outputs.combined_rcs }}
       run: |
         {
           echo "## Promote RC Summary"
@@ -136,4 +223,5 @@ runs:
           echo "| Final Version | \`${FINAL_VERSION:-N/A}\` |"
           echo "| Platforms | ${PLATFORMS:-N/A} |"
           echo "| Already Existed | ${ALREADY_EXISTS:-N/A} |"
+          echo "| Combined RCs | ${COMBINED_RCS:-N/A} |"
         } >> "$GITHUB_STEP_SUMMARY"

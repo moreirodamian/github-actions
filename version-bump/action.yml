@@ -153,15 +153,19 @@ runs:
 
         git fetch --tags --force >/dev/null 2>&1 || true
         HAS_RC_FOR_CORE="$(git tag -l "v${CORE}-rc.*" | wc -l | tr -d '[:space:]')"
+        HAS_FINAL_FOR_CORE="$(git tag -l "v${CORE}" | wc -l | tr -d '[:space:]')"
 
         DO_BUMP=false
         if ${IS_FINAL}; then
           DO_BUMP=true
+        elif [[ "${HAS_FINAL_FOR_CORE}" != "0" ]]; then
+          DO_BUMP=true
+          echo "Final tag v${CORE} already released: RC cycle closed, bumping for new RC."
         elif [[ "${HAS_RC_FOR_CORE}" == "0" ]]; then
           DO_BUMP=true
           echo "No existing RCs for ${CORE}: initial RC, will bump."
         else
-          echo "Existing RCs found for ${CORE}: continuing RC cycle without bump."
+          echo "Existing RCs found for ${CORE} and final not yet released: continuing RC cycle without bump."
         fi
 
         if ${DO_BUMP}; then
