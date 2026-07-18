@@ -13,7 +13,9 @@ set -euo pipefail
 #                            "conventional" - feat:, fix:, docs:, refactor:, ci:, chore:, etc.
 #                            "none"         - no categorization, flat list
 
-PREV_TAG="${1:?Usage: generate-changelog.sh <prev_tag> <current_tag> [platforms]}"
+# PREV_TAG may be empty on the very first release (no previous tag exists yet).
+# Only CURR_TAG is strictly required.
+PREV_TAG="${1-}"
 CURR_TAG="${2:?Usage: generate-changelog.sh <prev_tag> <current_tag> [platforms]}"
 PLATFORMS="${3:-}"
 
@@ -44,7 +46,14 @@ if [[ "${CURR_TAG}" == *-rc.* ]]; then
 fi
 
 # ── Collect commits ─────────────────────────────────────────────────
-changes="$(git log --oneline --no-merges "${PREV_TAG}..${CURR_TAG}" \
+# On the first release there is no previous tag, so walk the full history
+# reachable from CURR_TAG instead of a PREV_TAG..CURR_TAG range.
+if [[ -n "${PREV_TAG}" ]]; then
+  commit_range="${PREV_TAG}..${CURR_TAG}"
+else
+  commit_range="${CURR_TAG}"
+fi
+changes="$(git log --oneline --no-merges "${commit_range}" \
   | grep -v '\[Release Process\]' \
   | grep -v '\[skip ci\]' \
   || true)"
@@ -314,7 +323,11 @@ release_notes_file="$(mktemp)"
   echo "---"
   echo ""
   REPO_SLUG="${GITHUB_REPOSITORY:-owner/repo}"
-  echo "**Full diff:** [\`${PREV_TAG}...${CURR_TAG}\`](https://github.com/${REPO_SLUG}/compare/${PREV_TAG}...${CURR_TAG})"
+  if [[ -n "${PREV_TAG}" ]]; then
+    echo "**Full diff:** [\`${PREV_TAG}...${CURR_TAG}\`](https://github.com/${REPO_SLUG}/compare/${PREV_TAG}...${CURR_TAG})"
+  else
+    echo "**Full diff:** [\`${CURR_TAG}\`](https://github.com/${REPO_SLUG}/commits/${CURR_TAG})"
+  fi
 
 } > "${release_notes_file}"
 
