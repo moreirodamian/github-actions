@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+    <url>
+         <loc>https://moreirodamian.github.io/github-actions/</loc>
+         <lastmod>2026-07-26</lastmod>
+    </url>
+    <url>
+         <loc>https://moreirodamian.github.io/github-actions/getting-started/</loc>
+         <lastmod>2026-07-26</lastmod>
+    </url>
+    <url>
+         <loc>https://moreirodamian.github.io/github-actions/actions/argocd-deploy/</loc>
+         <lastmod>2026-07-26</lastmod>
+    </url>
+    <url>
+         <loc>https://moreirodamian.github.io/github-actions/actions/docker-build/</loc>
+         <lastmod>2026-07-26</lastmod>
+    </url>
+    <url>
+         <loc>https://moreirodamian.github.io/github-actions/actions/generate-release/</loc>
+         <lastmod>2026-07-26</lastmod>
+    </url>
+    <url>
+         <loc>https://moreirodamian.github.io/github-actions/actions/promote-rc/</loc>
+         <lastmod>2026-07-26</lastmod>
+    </url>
+    <url>
+         <loc>https://moreirodamian.github.io/github-actions/actions/rclone-upload/</loc>
+         <lastmod>2026-07-26</lastmod>
+    </url>
+    <url>
+         <loc>https://moreirodamian.github.io/github-actions/actions/version-bump/</loc>
+         <lastmod>2026-07-26</lastmod>
+    </url>
+</urlset>

@@ -1,0 +1,5 @@
+/* Action reference tables: prevent wrapping in the Name column */
+.md-typeset table:not([class]) th:first-child,
+.md-typeset table:not([class]) td:first-child {
+  white-space: nowrap;
+}
