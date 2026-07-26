@@ -38,6 +38,10 @@ inputs:
     description: "ArgoCD CLI version tag (from GitHub releases)."
     required: false
     default: "v2.13.3"
+  extra_headers:
+    description: "Comma-separated extra HTTP headers sent with every argocd request (format: 'Name:value,Name2:value2'). Useful to pass a WAF/CDN bypass header."
+    required: false
+    default: ""
   retry_count:
     description: "Number of retries for sync operation (0 = no retry). Uses exponential backoff."
     required: false
@@ -109,6 +113,7 @@ runs:
         HELM_VALUES: ${{ inputs.helm_values }}
         ARGOCD_TIMEOUT: ${{ inputs.timeout_seconds }}
         GRPC_WEB: ${{ inputs.grpc_web }}
+        EXTRA_HEADERS: ${{ inputs.extra_headers }}
         RETRY_COUNT: ${{ inputs.retry_count }}
         DEBUG: ${{ inputs.debug }}
       run: |
@@ -129,6 +134,17 @@ runs:
           BASE_FLAGS+=(--grpc-web)
         fi
         BASE_FLAGS+=(--server "${ARGOCD_URL}" --auth-token "${ARGOCD_TOKEN}")
+
+        # Extra headers, e.g. a WAF/CDN bypass token when the ArgoCD API sits
+        # behind Cloudflare with a managed challenge.
+        if [[ -n "${EXTRA_HEADERS:-}" ]]; then
+          IFS=',' read -r -a HDR_ARRAY <<< "${EXTRA_HEADERS}"
+          for H in "${HDR_ARRAY[@]}"; do
+            H_TRIM="$(echo "${H}" | xargs)"
+            [[ -z "${H_TRIM}" ]] && continue
+            BASE_FLAGS+=(--header "${H_TRIM}")
+          done
+        fi
 
         enc() { printf '%s' "$1" | base64 2>/dev/null || printf '%s' "$1" | base64; }
 
